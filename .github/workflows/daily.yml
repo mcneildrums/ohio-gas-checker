@@ -15,7 +15,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install -r requirements.txt
+          run: |
+            pip install -r requirements.txt
+            pip install --upgrade certifi requests urllib3
 
       - name: Run scraper + diff
         run: python apples_to_apples_diff.py
