@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # apples_to_apples_diff.py
+# Snapshot Ohio PUCO Apples-to-Apples CSV(s), compare to prior snapshot, and report field-level changes.
+# Handles ASP.NET WebForms postback CSV export.
 
 import csv, hashlib, io, os, sys, datetime, time
 import requests
@@ -8,19 +10,21 @@ import pandas as pd
 from urllib.parse import urljoin
 import urllib3
 
-print("SCRIPT_VERSION: 2025-08-19-1")  # <-- shows up in logs so we know this file is the one running
+print("SCRIPT_VERSION: 2025-08-19-POSTBACK")
 
-# --- CONFIG ---
+# --- CONFIG: add the pages you want to monitor ---
 TARGETS = [
     ("Enbridge/Dominion - Residential",
      "https://www.energychoice.ohio.gov/ApplesToApplesComparision.aspx?Category=NaturalGas&RateCode=1&TerritoryId=1"),
+    # Add more if needed:
+    # ("Duke - Residential", "https://www.energychoice.ohio.gov/ApplesToApplesComparision.aspx?Category=NaturalGas&RateCode=1&TerritoryId=10"),
 ]
 
-OUTDIR = "data"
+OUTDIR = "data"  # where daily CSV snapshots are saved
 os.makedirs(OUTDIR, exist_ok=True)
 today = datetime.date.today().isoformat()
 
-# Silence warnings if we use verify=False as fallback
+# Quiet warnings if we fall back to verify=False (public CSV is acceptable risk here).
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HEADERS = {
@@ -29,48 +33,153 @@ HEADERS = {
                    "Chrome/124.0.0.0 Safari/537.36")
 }
 
-def http_get(url, max_retries=3, backoff=2.0):
+def http_get(session, url, max_retries=3, backoff=2.0, verify=True):
     last_err = None
     for _ in range(max_retries):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=60)
+            r = session.get(url, headers=HEADERS, timeout=60, verify=verify)
             r.raise_for_status()
             return r
         except Exception as e:
             last_err = e
             time.sleep(backoff)
-    # Final fallback: skip SSL verification for this public CSV/page
-    r = requests.get(url, headers=HEADERS, timeout=60, verify=False)
-    r.raise_for_status()
-    return r
+    if verify:
+        # Final fallback: try with verify=False once
+        return http_get(session, url, max_retries=1, backoff=0.0, verify=False)
+    raise last_err
 
-def find_csv_export_link(page_url):
-    r = http_get(page_url)
-    soup = BeautifulSoup(r.text, "html.parser")
+def http_post(session, url, data, max_retries=3, backoff=2.0, verify=True):
+    last_err = None
+    for _ in range(max_retries):
+        try:
+            r = session.post(url, headers=HEADERS, data=data, timeout=60, verify=verify)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_err = e
+            time.sleep(backoff)
+    if verify:
+        # Final fallback: try with verify=False once
+        return http_post(session, url, data, max_retries=1, backoff=0.0, verify=False)
+    raise last_err
 
-    # Primary: search by visible link text
+def extract_hidden_fields(soup):
+    """
+    Collect standard ASP.NET WebForms hidden inputs so we can replay a postback.
+    """
+    fields = {}
+    for name in ["__EVENTTARGET", "__EVENTARGUMENT", "__VIEWSTATE", "__VIEWSTATEGENERATOR",
+                 "__EVENTVALIDATION", "__VIEWSTATEENCRYPTED"]:
+        tag = soup.find("input", {"name": name})
+        if tag and tag.has_attr("value"):
+            fields[name] = tag["value"]
+    # Include any other hidden inputs
+    for inp in soup.find_all("input", {"type": "hidden"}):
+        name = inp.get("name")
+        if name and name not in fields:
+            fields[name] = inp.get("value", "")
+    return fields
+
+def find_export_target(soup):
+    """
+    Look for <a> with text 'Export all offers to CSV (Excel)' or any a[href^="javascript:__doPostBack(...)"]
+    and return either:
+      - ("postback", event_target_string)
+      - ("direct", absolute_or_relative_url_to_csv)
+    """
+    # 1) Try by visible text first
     for a in soup.find_all("a"):
         text = (a.get_text() or "").strip().lower()
+        href = (a.get("href") or "").strip()
         if "export all offers to csv" in text:
-            href = a.get("href")
-            if href:
-                return href if href.startswith(("http://", "https://")) else urljoin(page_url, href)
+            if href.lower().startswith("javascript:__dopostback("):
+                # Parse event target out of javascript:__doPostBack('ctl00$ContentPlaceHolder1$lnkExportToCSV','')
+                try:
+                    inside = href[href.index("(")+1:href.rindex(")")]
+                    # inside is like "'ctl00$ContentPlaceHolder1$lnkExportToCSV',''"
+                    evt_target = inside.split(",")[0].strip().strip("'").strip('"')
+                    return ("postback", evt_target)
+                except Exception:
+                    pass
+            return ("direct", href)
 
-    # Fallback: any link that looks like CSV
+    # 2) Fallback: any CSV-like link
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if ".csv" in href.lower():
-            return href if href.startswith(("http://", "https://")) else urljoin(page_url, href)
+            return ("direct", href)
 
-    raise RuntimeError("CSV export link not found on page: " + page_url)
+    # 3) Fallback: any postback link with "export" in the surrounding text
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip().lower()
+        if href.startswith("javascript:__dopostback("):
+            txt = (a.get_text() or "").strip().lower()
+            if "export" in txt:
+                inside = a["href"][a["href"].index("(")+1:a["href"].rindex(")")]
+                evt_target = inside.split(",")[0].strip().strip("'").strip('"')
+                return ("postback", evt_target)
 
-def normalized_df_from_csv(url):
-    r = http_get(url)
-    data = io.BytesIO(r.content)
+    raise RuntimeError("Could not find export link or postback target on the page.")
+
+def fetch_csv_bytes_from_page(page_url):
+    """
+    Loads the page, discovers the export mechanism, and returns CSV file bytes.
+    Handles ASP.NET postback by replaying __EVENTTARGET form POST.
+    """
+    with requests.Session() as s:
+        # 1) Load the page
+        r = http_get(s, page_url)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        kind, payload = find_export_target(soup)
+
+        if kind == "direct":
+            href = payload
+            full = href if href.startswith(("http://", "https://")) else urljoin(page_url, href)
+            r2 = http_get(s, full)
+            return r2.content
+
+        elif kind == "postback":
+            event_target = payload
+            # Collect hidden fields
+            fields = extract_hidden_fields(soup)
+            fields["__EVENTTARGET"] = event_target
+            fields["__EVENTARGUMENT"] = fields.get("__EVENTARGUMENT", "")
+
+            # POST back to the same page URL
+            r2 = http_post(s, page_url, data=fields)
+
+            # Some WebForms apps respond with a file download directly; others redirect.
+            # If not CSV yet, sometimes the page returns HTML plus a link—try to detect.
+            content_type = r2.headers.get("Content-Type", "").lower()
+            if "text/csv" in content_type or "application/vnd.ms-excel" in content_type:
+                return r2.content
+
+            # If HTML came back, see if it now has a direct CSV link
+            soup2 = BeautifulSoup(r2.text, "html.parser")
+            for a in soup2.find_all("a", href=True):
+                if ".csv" in a["href"].lower():
+                    full = a["href"] if a["href"].startswith(("http://", "https://")) else urljoin(page_url, a["href"])
+                    r3 = http_get(s, full)
+                    return r3.content
+
+            # Last resort: maybe the response is a CSV but mislabeled; if it looks like CSV, accept it
+            if r2.text and ("," in r2.text or "\t" in r2.text) and "\n" in r2.text:
+                return r2.content
+
+            raise RuntimeError("Postback completed but CSV content was not found")
+
+        else:
+            raise RuntimeError("Unknown export kind: " + str(kind))
+
+def df_from_csv_bytes(data_bytes):
+    # Let pandas sniff encoding; treat everything as string for clean diffs
+    data = io.BytesIO(data_bytes)
     df = pd.read_csv(data, dtype=str)
     df.columns = [c.strip() for c in df.columns]
     df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
 
+    # Use a real ID if present; else build a stable key
     id_cols = [c for c in df.columns if ("offer" in c.lower() and "id" in c.lower())]
     if id_cols:
         keycol = id_cols[0]
@@ -130,13 +239,17 @@ def diff_frames(prev, curr):
 
 def main():
     reports = []
-    for name, page in TARGETS:
-        csv_url = find_csv_export_link(page)
-        curr_df = normalized_df_from_csv(csv_url)
 
+    for name, page in TARGETS:
+        # Download CSV bytes via either direct link or ASP.NET postback
+        csv_bytes = fetch_csv_bytes_from_page(page)
+        curr_df = df_from_csv_bytes(csv_bytes)
+
+        # Save today's snapshot
         snap_path = os.path.join(OUTDIR, f"{name}_{today}.csv".replace(" ", "_"))
         curr_df.to_csv(snap_path, index=False)
 
+        # Find prior snapshot (most recent previous day for this target)
         prefix = f"{name}_".replace(" ", "_")
         prev_files = sorted(
             f for f in os.listdir(OUTDIR)
@@ -147,10 +260,12 @@ def main():
             prev_df = pd.read_csv(os.path.join(OUTDIR, prev_files[-1]), dtype=str)
             report = diff_frames(prev_df, curr_df)
         else:
+            # First run: everything is "added"
             report = {"added": curr_df.to_dict(orient="records"), "removed": [], "changed": []}
 
         reports.append((name, report))
 
+    # Human-friendly report
     lines = []
     for name, r in reports:
         lines.append(f"=== {name} ===")
