@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # apples_to_apples_diff.py
 # Snapshot Ohio PUCO Apples-to-Apples CSV(s), compare to prior snapshot, and report field-level changes.
-# Handles ASP.NET WebForms postback CSV export.
+# Handles ASP.NET WebForms postback CSV export and writes two files:
+# - report.txt  -> full summary (counts + detailed per-field changes)
+# - changes.txt -> CHANGES ONLY (Company | Field | Old -> New), for email body
 
 import csv, hashlib, io, os, sys, datetime, time
 import requests
@@ -10,7 +12,7 @@ import pandas as pd
 from urllib.parse import urljoin
 import urllib3
 
-print("SCRIPT_VERSION: 2025-08-19-POSTBACK-SAFE")
+print("SCRIPT_VERSION: 2025-08-19-POSTBACK-SAFE-DIFFONLY")
 
 # --- CONFIG: add the pages you want to monitor ---
 TARGETS = [
@@ -141,7 +143,7 @@ def df_from_csv_bytes(data_bytes):
     data = io.BytesIO(data_bytes)
     df = pd.read_csv(data, dtype=str)
     df.columns = [c.strip() for c in df.columns]
-    # applymap warning -> column-wise strip
+    # strip strings, avoid deprecated applymap
     df = df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
 
     id_cols = [c for c in df.columns if ("offer" in c.lower() and "id" in c.lower())]
@@ -199,17 +201,55 @@ def diff_frames(prev, curr):
         "changed": changed
     }
 
+def build_reports(name, report_dict):
+    """Return (full_text, changes_only_text) for one target."""
+    full = []
+    chg = []
+
+    full.append(f"=== {name} ===")
+    full.append(f"New: {len(report_dict['added'])} | Removed: {len(report_dict['removed'])} | Changed: {len(report_dict['changed'])}")
+
+    if report_dict["changed"]:
+        full.append("Changed details:")
+        chg.append(f"=== Changes for {name} ===")
+        chg.append("Company | Field | Old -> New")
+        chg.append("----------------------------------------")
+        for ch in report_dict["changed"]:
+            who = ch.get("supplier") or ch["key"]
+            for col, vals in ch["changes"].items():
+                before = vals["before"]
+                after = vals["after"]
+                full.append(f"- {who} | {col}: '{before}' -> '{after}'")
+                chg.append(f"{who} | {col} | {before} -> {after}")
+    else:
+        full.append("No field-level changes today.")
+        chg.append(f"=== Changes for {name} ===")
+        chg.append("No field-level changes today.")
+
+    # (Optional) summarize adds/removes briefly
+    if report_dict["added"]:
+        full.append(f"Added offers: {len(report_dict['added'])}")
+    if report_dict["removed"]:
+        full.append(f"Removed offers: {len(report_dict['removed'])}")
+
+    full.append("")  # blank line
+    chg.append("")   # blank line
+    return "\n".join(full), "\n".join(chg)
+
 def main():
-    reports = []
+    reports_full = []
+    reports_changes = []
+
     for name, page in TARGETS:
         csv_bytes = fetch_csv_bytes_from_page(page)
         curr_df = df_from_csv_bytes(csv_bytes)
 
-        # Safe filename bits
+        # Safe filename for this target
         base = safe_name(name)
         snap_path = os.path.join(OUTDIR, f"{base}_{today}.csv".replace(" ", "_"))
         curr_df.to_csv(snap_path, index=False)
 
+        # Find prior snapshot (previous day or earlier for this target)
         prefix = f"{base}_".replace(" ", "_")
         prev_files = sorted(
             f for f in os.listdir(OUTDIR)
@@ -222,23 +262,18 @@ def main():
         else:
             report = {"added": curr_df.to_dict(orient="records"), "removed": [], "changed": []}
 
-        reports.append((name, report))
+        full_text, chg_text = build_reports(name, report)
+        reports_full.append(full_text)
+        reports_changes.append(chg_text)
 
-    lines = []
-    for name, r in reports:
-        lines.append(f"=== {name} ===")
-        lines.append(f"New: {len(r['added'])} | Removed: {len(r['removed'])} | Changed: {len(r['changed'])}")
-        for ch in r["changed"]:
-            who = ch.get("supplier") or ch["key"]
-            lines.append(f"- {who}:")
-            for col, vals in ch["changes"].items():
-                lines.append(f"    {col}: '{vals['before']}' -> '{vals['after']}'")
-        lines.append("")
-
-    report_txt = "\n".join(lines)
+    # Write the two files
     with open("report.txt", "w", encoding="utf-8") as f:
-        f.write(report_txt)
-    print(report_txt)
+        f.write("\n".join(reports_full))
+    with open("changes.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(reports_changes))
+
+    # Print the concise changes to logs (handy in Actions)
+    print("\n".join(reports_changes))
 
 if __name__ == "__main__":
     sys.exit(main())
