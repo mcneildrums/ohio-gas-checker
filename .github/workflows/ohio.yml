@@ -56,7 +56,7 @@ jobs:
           username: ${{ secrets.SMTP_USERNAME }}     # your full email address
           password: ${{ secrets.SMTP_PASSWORD }}     # App Password (not your normal password)
           subject: "Ohio Apples-to-Apples Daily Diff"
-          to: spatel@riverbendeg.com, jfeinstein@riverbendeg.com
+          to: mcneildrums@gmail.com
           from: ${{ secrets.REPORT_FROM_EMAIL }}
           body: ${{ steps.get_report.outputs.body }}
           attachments: report.txt
