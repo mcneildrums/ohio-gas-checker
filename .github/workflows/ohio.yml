@@ -65,7 +65,7 @@ jobs:
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
           subject: "Ohio Apples-to-Apples: Changes Since Yesterday"
-          to: ${{ secrets.REPORT_TO_EMAIL }}
+          to: spatel@riverbendeg.com, jfeinstein@riverbendeg.com
           from: ${{ secrets.REPORT_FROM_EMAIL }}
           body: ${{ steps.get_changes.outputs.body }}
           attachments: |
