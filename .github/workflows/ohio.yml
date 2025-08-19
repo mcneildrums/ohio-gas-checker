@@ -8,6 +8,8 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # needed to commit snapshot CSVs
     steps:
       - uses: actions/checkout@v4
 
@@ -37,24 +39,24 @@ jobs:
           name: apples-to-apples-report
           path: report.txt
 
+      # Read report.txt into an output so we can use it as the email body
       - name: Read report into output
         id: get_report
         run: |
-          echo "body<<'EOF'" >> $GITHUB_OUTPUT
+          echo "body<<EOF" >> $GITHUB_OUTPUT
           cat report.txt >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Email report
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: ${{ secrets.SMTP_HOST }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          secure: false                 # true only if you use port 465
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
+          server_address: ${{ secrets.SMTP_HOST }}   # e.g. smtp.gmail.com
+          server_port: ${{ secrets.SMTP_PORT }}      # e.g. 587
+          secure: false                              # false for STARTTLS on 587; use true with port 465
+          username: ${{ secrets.SMTP_USERNAME }}     # your full email address
+          password: ${{ secrets.SMTP_PASSWORD }}     # App Password (not your normal password)
           subject: "Ohio Apples-to-Apples Daily Diff"
           to: ${{ secrets.REPORT_TO_EMAIL }}
           from: ${{ secrets.REPORT_FROM_EMAIL }}
           body: ${{ steps.get_report.outputs.body }}
-          attachments: report.txt        # optional: also attach the file
-
+          attachments: report.txt
