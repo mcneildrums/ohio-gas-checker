@@ -1,0 +1,50 @@
+name: apples-to-apples-daily
+on:
+  schedule:
+    - cron: "30 12 * * *"   # 12:30 UTC = 07:30 America/Chicago
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run scraper + diff
+        run: python apples_to_apples_diff.py
+
+      - name: Commit snapshots
+        run: |
+          git config user.name "automation"
+          git config user.email "noreply@example.com"
+          git add data/*.csv || true
+          git commit -m "snapshot $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "nothing to commit"
+          git push || true
+
+      - name: Upload report artifact (for record)
+        uses: actions/upload-artifact@v4
+        with:
+          name: apples-to-apples-report
+          path: report.txt
+
+      # --- Email the report (uses SMTP) ---
+      - name: Email report
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Ohio Apples-to-Apples Daily Diff"
+          to: ${{ secrets.REPORT_TO_EMAIL }}
+          from: ${{ secrets.REPORT_FROM_EMAIL }}
+          content_type: text/plain
+          body: |
+            $(cat report.txt)
