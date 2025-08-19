@@ -39,24 +39,35 @@ jobs:
           name: apples-to-apples-report
           path: report.txt
 
-      # Read report.txt into an output so we can use it as the email body
-      - name: Read report into output
-        id: get_report
+      # Read changes.txt (diff-only) into an output for the email body
+      - name: Read changes into output
+        id: get_changes
         run: |
           echo "body<<EOF" >> $GITHUB_OUTPUT
-          cat report.txt >> $GITHUB_OUTPUT
+          cat changes.txt >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Email report
+      # Keep uploading both files as artifacts for reference
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apples-to-apples-artifacts
+          path: |
+            report.txt
+            changes.txt
+
+      - name: Email report (diff-only in body)
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: ${{ secrets.SMTP_HOST }}   # e.g. smtp.gmail.com
-          server_port: ${{ secrets.SMTP_PORT }}      # e.g. 587
-          secure: false                              # false for STARTTLS on 587; use true with port 465
-          username: ${{ secrets.SMTP_USERNAME }}     # your full email address
-          password: ${{ secrets.SMTP_PASSWORD }}     # App Password (not your normal password)
-          subject: "Ohio Apples-to-Apples Daily Diff"
-          to: mcneildrums@gmail.com
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          secure: false
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Ohio Apples-to-Apples: Changes Since Yesterday"
+          to: ${{ secrets.REPORT_TO_EMAIL }}
           from: ${{ secrets.REPORT_FROM_EMAIL }}
-          body: ${{ steps.get_report.outputs.body }}
-          attachments: report.txt
+          body: ${{ steps.get_changes.outputs.body }}
+          attachments: |
+            report.txt
+            changes.txt
