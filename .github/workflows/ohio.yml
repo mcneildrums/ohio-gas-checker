@@ -1,8 +1,9 @@
 name: apples-to-apples-daily
+
 on:
   schedule:
-    - cron: "30 12 * * *"   # 07:30 America/Chicago
-  workflow_dispatch:
+    - cron: "30 12 * * *"   # runs daily at 07:30 AM America/Chicago
+  workflow_dispatch:         # lets you run it manually
 
 jobs:
   run:
@@ -14,10 +15,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
-          run: |
-            pip install -r requirements.txt
-            pip install --upgrade certifi requests urllib3
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install --upgrade certifi requests urllib3
 
       - name: Run scraper + diff
         run: python apples_to_apples_diff.py
@@ -30,13 +31,12 @@ jobs:
           git commit -m "snapshot $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "nothing to commit"
           git push || true
 
-      - name: Upload report artifact (for record)
+      - name: Upload report artifact
         uses: actions/upload-artifact@v4
         with:
           name: apples-to-apples-report
           path: report.txt
 
-      # --- Email the report (uses SMTP) ---
       - name: Email report
         uses: dawidd6/action-send-mail@v3
         with:
