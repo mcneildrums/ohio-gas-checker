@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # apples_to_apples_diff.py
-# Snapshot Ohio PUCO Apples-to-Apples CSV(s), compare to prior snapshot, and report field-level changes.
 
 import csv, hashlib, io, os, sys, datetime, time
 import requests
@@ -9,20 +8,19 @@ import pandas as pd
 from urllib.parse import urljoin
 import urllib3
 
-# --- CONFIG: add the pages you want to monitor ---
+print("SCRIPT_VERSION: 2025-08-19-1")  # <-- shows up in logs so we know this file is the one running
+
+# --- CONFIG ---
 TARGETS = [
     ("Enbridge/Dominion - Residential",
      "https://www.energychoice.ohio.gov/ApplesToApplesComparision.aspx?Category=NaturalGas&RateCode=1&TerritoryId=1"),
-    # Add more if needed, e.g.:
-    # ("Duke - Residential", "https://www.energychoice.ohio.gov/ApplesToApplesComparision.aspx?Category=NaturalGas&RateCode=1&TerritoryId=10"),
-    # ("CenterPoint - Residential", "https://www.energychoice.ohio.gov/ApplesToApplesComparision.aspx?Category=NaturalGas&RateCode=1&TerritoryId=2"),
 ]
 
-OUTDIR = "data"  # where daily CSV snapshots are saved
+OUTDIR = "data"
 os.makedirs(OUTDIR, exist_ok=True)
 today = datetime.date.today().isoformat()
 
-# Quiet warnings if we fall back to verify=False (public CSV is acceptable risk here).
+# Silence warnings if we use verify=False as fallback
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HEADERS = {
@@ -32,11 +30,8 @@ HEADERS = {
 }
 
 def http_get(url, max_retries=3, backoff=2.0):
-    """
-    Try normal TLS (verify=True) a few times; on last resort, try with verify=False.
-    """
     last_err = None
-    for i in range(max_retries):
+    for _ in range(max_retries):
         try:
             r = requests.get(url, headers=HEADERS, timeout=60)
             r.raise_for_status()
@@ -44,20 +39,16 @@ def http_get(url, max_retries=3, backoff=2.0):
         except Exception as e:
             last_err = e
             time.sleep(backoff)
-    # Final fallback: skip SSL verification (state public CSV)
+    # Final fallback: skip SSL verification for this public CSV/page
     r = requests.get(url, headers=HEADERS, timeout=60, verify=False)
     r.raise_for_status()
     return r
 
 def find_csv_export_link(page_url):
-    """
-    Load the Apples-to-Apples page and find the 'Export all offers to CSV (Excel)' link.
-    Falls back to any link containing '.csv' if the text changes.
-    """
     r = http_get(page_url)
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # Primary: look for visible text
+    # Primary: search by visible link text
     for a in soup.find_all("a"):
         text = (a.get_text() or "").strip().lower()
         if "export all offers to csv" in text:
@@ -65,30 +56,21 @@ def find_csv_export_link(page_url):
             if href:
                 return href if href.startswith(("http://", "https://")) else urljoin(page_url, href)
 
-    # Fallback: scan for CSV-ish hrefs
+    # Fallback: any link that looks like CSV
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if ".csv" in href.lower():
             return href if href.startswith(("http://", "https://")) else urljoin(page_url, href)
 
-    # Last resort: fail clearly
     raise RuntimeError("CSV export link not found on page: " + page_url)
 
 def normalized_df_from_csv(url):
-    """
-    Download CSV and standardize column names/whitespace.
-    Generate a stable key per row using a true Offer ID if present,
-    otherwise hash important columns.
-    """
     r = http_get(url)
     data = io.BytesIO(r.content)
-
-    # Let pandas sniff encoding; treat everything as string for clean diffs
     df = pd.read_csv(data, dtype=str)
     df.columns = [c.strip() for c in df.columns]
     df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
 
-    # Use a real ID if present
     id_cols = [c for c in df.columns if ("offer" in c.lower() and "id" in c.lower())]
     if id_cols:
         keycol = id_cols[0]
@@ -114,9 +96,6 @@ def normalized_df_from_csv(url):
     return df
 
 def diff_frames(prev, curr):
-    """
-    Return dict with added/removed/changed. 'changed' contains per-column before/after.
-    """
     key = "_Key"
     prev = prev.set_index(key, drop=False)
     curr = curr.set_index(key, drop=False)
@@ -130,7 +109,7 @@ def diff_frames(prev, curr):
         rp, rc = prev.loc[k], curr.loc[k]
         diffs = {}
         for col in sorted(set(curr.columns).intersection(prev.columns)):
-            if col.startswith("_"):  # skip internal
+            if col.startswith("_"):
                 continue
             vp = "" if pd.isna(rp[col]) else str(rp[col])
             vc = "" if pd.isna(rc[col]) else str(rc[col])
@@ -151,25 +130,13 @@ def diff_frames(prev, curr):
 
 def main():
     reports = []
-
     for name, page in TARGETS:
-        try:
-            csv_url = find_csv_export_link(page)
-        except Exception as e:
-            print(f"ERROR locating CSV link for {name}: {e}")
-            raise
+        csv_url = find_csv_export_link(page)
+        curr_df = normalized_df_from_csv(csv_url)
 
-        try:
-            curr_df = normalized_df_from_csv(csv_url)
-        except Exception as e:
-            print(f"ERROR downloading/reading CSV for {name}: {e}")
-            raise
-
-        # Save today's snapshot
         snap_path = os.path.join(OUTDIR, f"{name}_{today}.csv".replace(" ", "_"))
         curr_df.to_csv(snap_path, index=False)
 
-        # Find prior snapshot (most recent previous day for this target)
         prefix = f"{name}_".replace(" ", "_")
         prev_files = sorted(
             f for f in os.listdir(OUTDIR)
@@ -180,12 +147,10 @@ def main():
             prev_df = pd.read_csv(os.path.join(OUTDIR, prev_files[-1]), dtype=str)
             report = diff_frames(prev_df, curr_df)
         else:
-            # First run: everything is "added"
             report = {"added": curr_df.to_dict(orient="records"), "removed": [], "changed": []}
 
         reports.append((name, report))
 
-    # Human-friendly report
     lines = []
     for name, r in reports:
         lines.append(f"=== {name} ===")
