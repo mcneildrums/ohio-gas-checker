@@ -9,10 +9,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import pandas as pd
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 import urllib3
 
-print("SCRIPT_VERSION: 2025-08-20-STABLE-KEYS+NORMALIZE-OLD+SAFEGET")
+print("SCRIPT_VERSION: 2025-08-20-STABLE-KEYS+URLNORM")
 
 # --- Pages to monitor ---
 TARGETS = [
@@ -48,19 +48,42 @@ TERM_FIELDS = [
     "TermLength", "Term (Months)", "Term", "Contract Term", "Term Months"
 ]
 
-# "Stable" (non-volatile) fields we may use to define an offer identity.
-# IMPORTANT: EXCLUDES any rate/term/marketing text so keys don't change when price/term change.
+# ID-ish fields we prefer if present (do NOT include rate/term here)
 OFFER_ID_HINT_FIELDS = [
-    "OfferId", "OfferID", "GasOfferId", "GasOfferID", "Offer Code", "OfferCode"
+    "OfferId", "OfferID", "GasOfferId", "GasOfferID", "Offer Code", "OfferCode",
+    "PlanID", "ProductID", "SKU", "Plan Code", "PlanCode"
 ]
+
+# Stable fields to fingerprint an offer (avoid volatile marketing and *exclude* rate/term)
+# Note: we removed fees and promo text from the key so those show as normal changes, not add/remove.
 STABLE_ID_FIELDS = [
     # Supplier identity
     "SupplierCompanyName", "CompanyName", "Supplier", "Company", "Supplier Name", "Company Name",
-    # Plan meta that tends to be stable for a given offer
-    "RateType", "EarlyTerminationFee", "Monthly Fee", "MonthlyFee", "Cancellation Fee", "CancellationFee",
-    # URLs often uniquely identify the exact plan SKU
+    # Plan meta that tends to be structurally stable
+    "RateType",
+    # URLs usually identify the exact SKU; we will normalize them (strip query/fragment)
     "TermsOfServiceURL", "SignUpNowURL",
+    # Optional: a plan/offer title if present (last resort; may change sometimes)
+    "Offer", "Offer Name", "Plan", "Product Name"
 ]
+
+# ---------- Helpers ----------
+
+def normalize_url(u: str) -> str:
+    """Normalize a URL for identity: lowercase scheme/host, keep only scheme/netloc/path; drop query & fragment."""
+    if not u:
+        return ""
+    try:
+        parts = urlsplit(u.strip())
+        scheme = (parts.scheme or "").lower()
+        netloc = (parts.netloc or "").lower()
+        path = parts.path or ""
+        return urlunsplit((scheme, netloc, path, "", ""))
+    except Exception:
+        return u.strip()
+
+def safe_name(name: str) -> str:
+    return "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in name)
 
 # ---------- HTTP helpers with retries/timeouts ----------
 
@@ -220,8 +243,11 @@ def _first_present(row_like, cols):
 
 def _stable_offer_key(row):
     """
-    Prefer a real OfferID-ish column. If absent, hash a tuple of stable fields.
-    Critically, DO NOT include rate, term, or marketing text in the key.
+    Build a stable key for an offer:
+    1) Use real ID columns if present (OfferID, PlanID, etc.)
+    2) Else, hash a tuple of stable fields (Supplier, RateType, normalized URLs, optional plan title).
+       IMPORTANT: Do NOT include rate or term or promo text.
+       Normalize URLs to ignore querystrings so tracking params don't create fake new offers.
     """
     # 1) Real ID columns if present
     for c in row.index:
@@ -230,14 +256,16 @@ def _stable_offer_key(row):
             if v:
                 return f"ID::{v}"
 
-    # 2) Build from stable fields (supplier + URLs + plan meta)
+    # 2) Construct from stable fields
     parts = []
     for c in STABLE_ID_FIELDS:
         if c in row.index:
             v = str(row[c]).strip()
+            if c in ("TermsOfServiceURL", "SignUpNowURL"):
+                v = normalize_url(v)
             parts.append(f"{c}={v}")
 
-    # If we couldn't collect anything (extremely unlikely), fallback to supplier only:
+    # If we couldn't collect anything, fallback to supplier only
     if not parts:
         supplier = _first_present(row, SUPPLIER_NAME_COLS)
         parts = [f"Supplier={supplier}"]
@@ -285,7 +313,12 @@ def normalize_loaded_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["_Term"] = df.apply(lambda r: _first_present(r, TERM_FIELDS) or str(r["_Term"]), axis=1)
 
-    # ALWAYS recompute the stable key using the *current* logic
+    # ALWAYS recompute the stable key using the *current* logic (with URL normalization)
+    # Normalize URL fields before hashing
+    for url_col in ["TermsOfServiceURL", "SignUpNowURL"]:
+        if url_col in df.columns:
+            df[url_col] = df[url_col].fillna("").astype(str).map(normalize_url)
+
     df["_Key"] = df.apply(_stable_offer_key, axis=1)
     return df
 
@@ -318,14 +351,6 @@ def label_from_row(row: dict) -> tuple[str, str, str]:
     return (supplier or "n/a", rate or "n/a", term or "n/a")
 
 # ---------- Diff (based on STABLE offer key) ----------
-
-def _cell_to_str(v):
-    import pandas as pd
-    if isinstance(v, pd.Series):
-        v = v.iloc[0] if not v.empty else ""
-    if pd.isna(v):
-        return ""
-    return str(v)
 
 def diff_frames(prev, curr):
     import pandas as pd
@@ -475,9 +500,6 @@ def build_reports(name, report_dict):
 
 # ---------- Main ----------
 
-def safe_name(name: str) -> str:
-    return "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in name)
-
 def main():
     reports_full, reports_changes = [], []
 
@@ -497,10 +519,11 @@ def main():
 
         if prev_files:
             prev_df = pd.read_csv(os.path.join(OUTDIR, prev_files[-1]), dtype=str)
-            # Normalize the loaded (older) snapshot to current logic
+            # Normalize the loaded (older) snapshot to current logic (including URL normalization)
             prev_df = normalize_loaded_df(prev_df)
             report = diff_frames(prev_df, curr_df)
         else:
+            # First-ever run for this page: treat all as "added"
             report = {"added": curr_df.to_dict(orient="records"), "removed": [], "changed": []}
 
         full_text, chg_text = build_reports(name, report)
