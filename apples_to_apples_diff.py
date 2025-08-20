@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 # apples_to_apples_diff.py
 # Snapshot Ohio PUCO Apples-to-Apples CSV(s), compare to prior snapshot, and report field-level changes.
-# Handles ASP.NET WebForms postback CSV export and writes two files:
-# - report.txt  -> full summary (counts + detailed per-field changes)
-# - changes.txt -> CHANGES ONLY (Company | Field | Old -> New), for email body
+# Handles ASP.NET WebForms postback CSV export.
+# Writes:
+#   - report.txt  -> full summary (counts + changed fields)
+#   - changes.txt -> CHANGES ONLY (Company | Field | Old -> New)
 
 import csv, hashlib, io, os, sys, datetime, time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import pandas as pd
 from urllib.parse import urljoin
 import urllib3
 
-print("SCRIPT_VERSION: 2025-08-19-POSTBACK-SAFE-DIFFONLY")
+print("SCRIPT_VERSION: 2025-08-20-ROBUST")
 
 # --- CONFIG: add the pages you want to monitor ---
 TARGETS = [
@@ -21,50 +24,85 @@ TARGETS = [
     # Add more if needed
 ]
 
-OUTDIR = "data"  # where daily CSV snapshots are saved
+OUTDIR = "data"
 os.makedirs(OUTDIR, exist_ok=True)
 today = datetime.date.today().isoformat()
 
-# Quiet warnings if we fall back to verify=False (public CSV is acceptable risk here).
+# Quiet warnings if we use verify=False as fallback
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Headers + a realistic browser fingerprint
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/124.0.0.0 Safari/537.36")
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 def safe_name(name: str) -> str:
-    """Make a string safe for filenames."""
     return "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in name)
 
-def http_get(session, url, max_retries=3, backoff=2.0, verify=True):
-    last_err = None
-    for _ in range(max_retries):
-        try:
-            r = session.get(url, headers=HEADERS, timeout=60, verify=verify)
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            last_err = e
-            time.sleep(backoff)
-    if verify:
-        return http_get(session, url, max_retries=1, backoff=0.0, verify=False)
-    raise last_err
+def setup_session():
+    """
+    Session with retry policy for transient network/server issues.
+    Retries 5x with exponential backoff on timeouts, 429, 5xx.
+    """
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=2.0,  # 0s, 2s, 4s, 8s, 16s…
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=10)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
 
-def http_post(session, url, data, max_retries=3, backoff=2.0, verify=True):
-    last_err = None
-    for _ in range(max_retries):
-        try:
-            r = session.post(url, headers=HEADERS, data=data, timeout=60, verify=verify)
+def http_get(session, url, verify=True, connect_timeout=20, read_timeout=180):
+    """
+    GET with long read timeout; on final attempt, try verify=False.
+    """
+    try:
+        r = session.get(url, timeout=(connect_timeout, read_timeout), verify=verify)
+        r.raise_for_status()
+        return r
+    except Exception:
+        if verify:
+            # one last try with verify disabled
+            r = session.get(url, timeout=(connect_timeout, read_timeout), verify=False)
             r.raise_for_status()
             return r
-        except Exception as e:
-            last_err = e
-            time.sleep(backoff)
-    if verify:
-        return http_post(session, url, data, max_retries=1, backoff=0.0, verify=False)
-    raise last_err
+        raise
+
+def http_post(session, url, data, verify=True, connect_timeout=20, read_timeout=240):
+    """
+    POST with long read timeout (CSV generation can be slow).
+    """
+    try:
+        r = session.post(url, data=data, timeout=(connect_timeout, read_timeout), verify=verify, headers={
+            **HEADERS,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.energychoice.ohio.gov",
+            "Referer": url,
+        })
+        r.raise_for_status()
+        return r
+    except Exception:
+        if verify:
+            r = session.post(url, data=data, timeout=(connect_timeout, read_timeout), verify=False, headers={
+                **HEADERS,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://www.energychoice.ohio.gov",
+                "Referer": url,
+            })
+            r.raise_for_status()
+            return r
+        raise
 
 def extract_hidden_fields(soup):
     fields = {}
@@ -73,10 +111,11 @@ def extract_hidden_fields(soup):
         tag = soup.find("input", {"name": name})
         if tag and tag.has_attr("value"):
             fields[name] = tag["value"]
+    # include all hidden inputs
     for inp in soup.find_all("input", {"type": "hidden"}):
-        name = inp.get("name")
-        if name and name not in fields:
-            fields[name] = inp.get("value", "")
+        n = inp.get("name")
+        if n and n not in fields:
+            fields[n] = inp.get("value", "")
     return fields
 
 def find_export_target(soup):
@@ -105,39 +144,53 @@ def find_export_target(soup):
     raise RuntimeError("Could not find export link or postback target on the page.")
 
 def fetch_csv_bytes_from_page(page_url):
-    with requests.Session() as s:
-        r = http_get(s, page_url)
-        soup = BeautifulSoup(r.text, "html.parser")
-        kind, payload = find_export_target(soup)
+    s = setup_session()
+    # 1) Load page
+    r = http_get(s, page_url)
+    soup = BeautifulSoup(r.text, "html.parser")
+    kind, payload = find_export_target(soup)
 
-        if kind == "direct":
-            href = payload
-            full = href if href.startswith(("http://", "https://")) else urljoin(page_url, href)
-            r2 = http_get(s, full)
-            return r2.content
+    if kind == "direct":
+        href = payload
+        full = href if href.startswith(("http://", "https://")) else urljoin(page_url, href)
+        r2 = http_get(s, full)
+        return r2.content
 
-        # postback
-        event_target = payload
-        fields = extract_hidden_fields(soup)
-        fields["__EVENTTARGET"] = event_target
-        fields["__EVENTARGUMENT"] = fields.get("__EVENTARGUMENT", "")
-        r2 = http_post(s, page_url, data=fields)
+    # kind == "postback"
+    event_target = payload
+    fields = extract_hidden_fields(soup)
+    fields["__EVENTTARGET"] = event_target
+    fields["__EVENTARGUMENT"] = fields.get("__EVENTARGUMENT", "")
+    # Some WebForms expect this when triggered by JS
+    if "__ASYNCPOST" not in fields:
+        fields["__ASYNCPOST"] = "false"
 
-        ct = r2.headers.get("Content-Type", "").lower()
-        if "text/csv" in ct or "application/vnd.ms-excel" in ct:
-            return r2.content
+    # Small pause seems to help this site
+    time.sleep(2)
 
+    r2 = http_post(s, page_url, data=fields)
+
+    ct = (r2.headers.get("Content-Type") or "").lower()
+    if "text/csv" in ct or "application/vnd.ms-excel" in ct:
+        return r2.content
+
+    # If HTML came back, try to find a CSV link in the response
+    try:
         soup2 = BeautifulSoup(r2.text, "html.parser")
         for a in soup2.find_all("a", href=True):
             if ".csv" in a["href"].lower():
                 full = a["href"] if a["href"].startswith(("http://", "https://")) else urljoin(page_url, a["href"])
                 r3 = http_get(s, full)
                 return r3.content
+    except Exception:
+        # sometimes response is not HTML; fall through to heuristic
+        pass
 
-        if r2.text and ("," in r2.text or "\t" in r2.text) and "\n" in r2.text:
-            return r2.content
+    # Heuristic: if response looks like CSV text but mislabeled
+    if r2.text and ("," in r2.text or "\t" in r2.text) and "\n" in r2.text:
+        return r2.content
 
-        raise RuntimeError("Postback completed but CSV content was not found")
+    raise RuntimeError("Postback completed but CSV content was not found")
 
 def df_from_csv_bytes(data_bytes):
     data = io.BytesIO(data_bytes)
@@ -202,7 +255,6 @@ def diff_frames(prev, curr):
     }
 
 def build_reports(name, report_dict):
-    """Return (full_text, changes_only_text) for one target."""
     full = []
     chg = []
 
@@ -226,14 +278,13 @@ def build_reports(name, report_dict):
         chg.append(f"=== Changes for {name} ===")
         chg.append("No field-level changes today.")
 
-    # (Optional) summarize adds/removes briefly
     if report_dict["added"]:
         full.append(f"Added offers: {len(report_dict['added'])}")
     if report_dict["removed"]:
         full.append(f"Removed offers: {len(report_dict['removed'])}")
 
-    full.append("")  # blank line
-    chg.append("")   # blank line
+    full.append("")
+    chg.append("")
     return "\n".join(full), "\n".join(chg)
 
 def main():
@@ -244,12 +295,10 @@ def main():
         csv_bytes = fetch_csv_bytes_from_page(page)
         curr_df = df_from_csv_bytes(csv_bytes)
 
-        # Safe filename for this target
         base = safe_name(name)
         snap_path = os.path.join(OUTDIR, f"{base}_{today}.csv".replace(" ", "_"))
         curr_df.to_csv(snap_path, index=False)
 
-        # Find prior snapshot (previous day or earlier for this target)
         prefix = f"{base}_".replace(" ", "_")
         prev_files = sorted(
             f for f in os.listdir(OUTDIR)
@@ -266,13 +315,11 @@ def main():
         reports_full.append(full_text)
         reports_changes.append(chg_text)
 
-    # Write the two files
     with open("report.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(reports_full))
     with open("changes.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(reports_changes))
 
-    # Print the concise changes to logs (handy in Actions)
     print("\n".join(reports_changes))
 
 if __name__ == "__main__":
