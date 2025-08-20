@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # apples_to_apples_diff.py
 # Purpose: Email only price/rate and term changes + list truly new/removed offers,
-# and keep keys STABLE so row/order changes don't create noise.
+# using STABLE keys so row/order changes or price/term updates don't cause noise.
 
 import hashlib, io, os, sys, datetime, time
 import requests
@@ -12,7 +12,7 @@ import pandas as pd
 from urllib.parse import urljoin
 import urllib3
 
-print("SCRIPT_VERSION: 2025-08-20-STABLE-KEYS")
+print("SCRIPT_VERSION: 2025-08-20-STABLE-KEYS+NORMALIZE-OLD")
 
 # --- Pages to monitor ---
 TARGETS = [
@@ -254,13 +254,70 @@ def df_from_csv_bytes(data_bytes):
     # Create stable key per row
     df["_Key"] = df.apply(_stable_offer_key, axis=1)
 
-    # Normalize a couple of convenience columns for later display/grouping
+    # Convenience columns for later display/grouping
     df["_Supplier"] = df.apply(lambda r: _first_present(r, SUPPLIER_NAME_COLS), axis=1)
     df["_Rate"]     = df.apply(lambda r: _first_present(r, RATE_FIELDS), axis=1)
     df["_Term"]     = df.apply(lambda r: _first_present(r, TERM_FIELDS), axis=1)
     return df
 
-# ---------- Diff (now based on STABLE offer key) ----------
+# ---------- Normalize older snapshots to current logic ----------
+
+def normalize_loaded_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    When we load an older snapshot, re-apply the current normalization so
+    keys/labels match the current logic. This avoids 'everything is NEW'.
+    """
+    df = _uniquify_columns(df)
+
+    # Recompute helper labels (safe even if already present)
+    if "_Supplier" not in df.columns:
+        df["_Supplier"] = df.apply(lambda r: _first_present(r, SUPPLIER_NAME_COLS), axis=1)
+    else:
+        df["_Supplier"] = df.apply(lambda r: _first_present(r, SUPPLIER_NAME_COLS) or str(r["_Supplier"]), axis=1)
+
+    if "_Rate" not in df.columns:
+        df["_Rate"] = df.apply(lambda r: _first_present(r, RATE_FIELDS), axis=1)
+    else:
+        df["_Rate"] = df.apply(lambda r: _first_present(r, RATE_FIELDS) or str(r["_Rate"]), axis=1)
+
+    if "_Term" not in df.columns:
+        df["_Term"] = df.apply(lambda r: _first_present(r, TERM_FIELDS), axis=1)
+    else:
+        df["_Term"] = df.apply(lambda r: _first_present(r, TERM_FIELDS) or str(r["_Term"]), axis=1)
+
+    # ALWAYS recompute the stable key using the *current* logic
+    df["_Key"] = df.apply(_stable_offer_key, axis=1)
+    return df
+
+def label_from_row(row: dict) -> tuple[str, str, str]:
+    """
+    Safe label builder for NEW/REMOVED sections that works for both old/new snapshots.
+    Returns (supplier, rate, term).
+    """
+    supplier = (row.get("_Supplier") or "").strip()
+    rate = (row.get("_Rate") or "").strip()
+    term = (row.get("_Term") or "").strip()
+
+    # If helpers not present (older snapshot dict), derive from raw columns:
+    if not supplier:
+        for c in SUPPLIER_NAME_COLS:
+            if c in row and str(row[c]).strip():
+                supplier = str(row[c]).strip()
+                break
+    if not rate:
+        for c in RATE_FIELDS:
+            if c in row and str(row[c]).strip():
+                rate = str(row[c]).strip()
+                break
+    if not term:
+        for c in TERM_FIELDS:
+            if c in row and str(row[c]).strip():
+                term = str(row[c]).strip()
+                break
+
+    return (supplier or "n/a", rate or "n/a", term or "n/a")
+
+# ---------- Diff (based on STABLE offer key) ----------
 
 def _cell_to_str(v):
     import pandas as pd
@@ -347,20 +404,18 @@ def build_reports(name, report_dict):
     else:
         chg.append("No rate/term changes today.")
 
-    # NEW OFFERS (deduped by supplier|term|rate for readability)
+    # NEW OFFERS (deduped by supplier|rate|term for readability)
     if report_dict["added"]:
         chg.append("")
         chg.append("NEW SUPPLIERS:")
         seen = set()
         for row in report_dict["added"]:
-            supplier = _label(row.get("_Supplier"))
-            rate = _label(row.get("_Rate"))
-            term = _label(row.get("_Term"))
+            supplier, rate, term = label_from_row(row)
             key = (supplier, rate, term)
             if key in seen:
                 continue
             seen.add(key)
-            chg.append(f"{supplier} (Rate={rate}, Term={term})")
+            chg.append(f"{supplier} (Rate={_label(rate)}, Term={_label(term)})")
 
     # REMOVED OFFERS (deduped)
     if report_dict["removed"]:
@@ -368,14 +423,12 @@ def build_reports(name, report_dict):
         chg.append("REMOVED SUPPLIERS:")
         seen = set()
         for row in report_dict["removed"]:
-            supplier = _label(row.get("_Supplier"))
-            rate = _label(row.get("_Rate"))
-            term = _label(row.get("_Term"))
+            supplier, rate, term = label_from_row(row)
             key = (supplier, rate, term)
             if key in seen:
                 continue
             seen.add(key)
-            chg.append(f"{supplier} (Rate={rate}, Term={term})")
+            chg.append(f"{supplier} (Rate={_label(rate)}, Term={_label(term)})")
 
     # Optional: brief full change dump (can help debug)
     if report_dict["changed"]:
@@ -420,6 +473,8 @@ def main():
 
         if prev_files:
             prev_df = pd.read_csv(os.path.join(OUTDIR, prev_files[-1]), dtype=str)
+            # Normalize the loaded (older) snapshot to current logic
+            prev_df = normalize_loaded_df(prev_df)
             report = diff_frames(prev_df, curr_df)
         else:
             report = {"added": curr_df.to_dict(orient="records"), "removed": [], "changed": []}
