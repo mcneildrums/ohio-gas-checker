@@ -15,7 +15,7 @@ import pandas as pd
 from urllib.parse import urljoin
 import urllib3
 
-print("SCRIPT_VERSION: 2025-08-20-ROBUST")
+print("SCRIPT_VERSION: 2025-08-20-ROBUST-UNIQUECOLS")
 
 # --- CONFIG: add the pages you want to monitor ---
 TARGETS = [
@@ -83,23 +83,19 @@ def http_post(session, url, data, verify=True, connect_timeout=20, read_timeout=
     """
     POST with long read timeout (CSV generation can be slow).
     """
+    headers = {
+        **HEADERS,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://www.energychoice.ohio.gov",
+        "Referer": url,
+    }
     try:
-        r = session.post(url, data=data, timeout=(connect_timeout, read_timeout), verify=verify, headers={
-            **HEADERS,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": "https://www.energychoice.ohio.gov",
-            "Referer": url,
-        })
+        r = session.post(url, data=data, timeout=(connect_timeout, read_timeout), verify=verify, headers=headers)
         r.raise_for_status()
         return r
     except Exception:
         if verify:
-            r = session.post(url, data=data, timeout=(connect_timeout, read_timeout), verify=False, headers={
-                **HEADERS,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": "https://www.energychoice.ohio.gov",
-                "Referer": url,
-            })
+            r = session.post(url, data=data, timeout=(connect_timeout, read_timeout), verify=False, headers=headers)
             r.raise_for_status()
             return r
         raise
@@ -195,10 +191,26 @@ def fetch_csv_bytes_from_page(page_url):
 def df_from_csv_bytes(data_bytes):
     data = io.BytesIO(data_bytes)
     df = pd.read_csv(data, dtype=str)
+
+    # Strip header whitespace
     df.columns = [c.strip() for c in df.columns]
-    # strip strings, avoid deprecated applymap
+
+    # Ensure column names are unique (add suffixes .2, .3, … if needed)
+    seen = {}
+    unique_cols = []
+    for c in df.columns:
+        if c not in seen:
+            seen[c] = 1
+            unique_cols.append(c)
+        else:
+            seen[c] += 1
+            unique_cols.append(f"{c}.{seen[c]}")  # e.g., "Rate", "Rate.2"
+    df.columns = unique_cols
+
+    # Strip cell whitespace (avoid deprecated applymap)
     df = df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
 
+    # Build a stable key: prefer an Offer*ID column, else hash selected fields
     id_cols = [c for c in df.columns if ("offer" in c.lower() and "id" in c.lower())]
     if id_cols:
         keycol = id_cols[0]
@@ -222,6 +234,14 @@ def df_from_csv_bytes(data_bytes):
     return df
 
 def diff_frames(prev, curr):
+    def cell_to_str(v):
+        # Handle pandas returning a Series when duplicate column names exist
+        if isinstance(v, pd.Series):
+            v = v.iloc[0] if not v.empty else ""
+        if pd.isna(v):
+            return ""
+        return str(v)
+
     key = "_Key"
     prev = prev.set_index(key, drop=False)
     curr = curr.set_index(key, drop=False)
@@ -231,20 +251,23 @@ def diff_frames(prev, curr):
     common_keys = curr.index.intersection(prev.index)
 
     changed = []
+    # Compare only over the intersection of columns (handles renamed/added columns)
+    common_cols = sorted(set(curr.columns).intersection(prev.columns))
+    # Skip internal columns
+    common_cols = [c for c in common_cols if not c.startswith("_")]
+
     for k in common_keys:
         rp, rc = prev.loc[k], curr.loc[k]
         diffs = {}
-        for col in sorted(set(curr.columns).intersection(prev.columns)):
-            if col.startswith("_"):
-                continue
-            vp = "" if pd.isna(rp[col]) else str(rp[col])
-            vc = "" if pd.isna(rc[col]) else str(rc[col])
+        for col in common_cols:
+            vp = cell_to_str(rp[col])
+            vc = cell_to_str(rc[col])
             if vp != vc:
                 diffs[col] = {"before": vp, "after": vc}
         if diffs:
             changed.append({
                 "key": k,
-                "supplier": rc.get("Supplier") or rc.get("Company") or "",
+                "supplier": cell_to_str(rc.get("Supplier") or rc.get("Company") or ""),
                 "changes": diffs
             })
 
