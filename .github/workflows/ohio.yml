@@ -58,7 +58,7 @@ jobs:
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}     # App Password if Gmail
           subject: "Ohio Apples-to-Apples: Changes Since Yesterday"
-          to: ${{ secrets.REPORT_TO_EMAIL }}         # or a comma-separated list
+          to: spatel@riverbendeg.com, jfeinstein@riverbendeg.com         # or a comma-separated list
           from: ${{ secrets.REPORT_FROM_EMAIL }}
           body: ${{ steps.get_changes.outputs.body }}
           attachments: |
