@@ -12,7 +12,7 @@ import pandas as pd
 from urllib.parse import urljoin
 import urllib3
 
-print("SCRIPT_VERSION: 2025-08-20-STABLE-KEYS+NORMALIZE-OLD")
+print("SCRIPT_VERSION: 2025-08-20-STABLE-KEYS+NORMALIZE-OLD+SAFEGET")
 
 # --- Pages to monitor ---
 TARGETS = [
@@ -328,6 +328,29 @@ def _cell_to_str(v):
     return str(v)
 
 def diff_frames(prev, curr):
+    import pandas as pd
+
+    def _get_val(row: pd.Series, col: str) -> str:
+        """
+        Safe scalar getter from a pandas Series:
+        - returns '' if missing or NaN
+        - if duplicate column labels exist (Series of values), pick first non-NaN
+        """
+        if col not in row.index:
+            return ""
+        v = row[col]
+        if isinstance(v, pd.Series):
+            if v.empty:
+                return ""
+            try:
+                non_na = v[~v.isna()]
+                v = non_na.iloc[0] if len(non_na) > 0 else v.iloc[0]
+            except Exception:
+                v = v.iloc[0]
+        if pd.isna(v):
+            return ""
+        return str(v).strip()
+
     key = "_Key"
     prev = prev.set_index(key, drop=False)
     curr = curr.set_index(key, drop=False)
@@ -345,19 +368,20 @@ def diff_frames(prev, curr):
         rp, rc = prev.loc[k], curr.loc[k]
         diffs = {}
         for col in common_cols:
-            vp = _cell_to_str(rp[col])
-            vc = _cell_to_str(rc[col])
+            vp = _get_val(rp, col)
+            vc = _get_val(rc, col)
             if vp != vc:
                 diffs[col] = {"before": vp, "after": vc}
 
         if diffs:
+            supplier = _get_val(rc, "_Supplier") or _get_val(rp, "_Supplier")
             changed.append({
                 "key": k,
-                "supplier": rc.get("_Supplier") or rp.get("_Supplier") or "",
-                "rate_before": rp.get("_Rate", ""),
-                "rate_after":  rc.get("_Rate", ""),
-                "term_before": rp.get("_Term", ""),
-                "term_after":  rc.get("_Term", ""),
+                "supplier": supplier,
+                "rate_before": _get_val(rp, "_Rate"),
+                "rate_after":  _get_val(rc, "_Rate"),
+                "term_before": _get_val(rp, "_Term"),
+                "term_after":  _get_val(rc, "_Term"),
                 "changes": diffs,
             })
 
