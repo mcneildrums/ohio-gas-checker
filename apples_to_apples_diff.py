@@ -2,6 +2,7 @@
 # apples_to_apples_diff.py
 # Purpose: Email only price/rate and term changes + list truly new/removed offers,
 # using STABLE keys so row/order changes or price/term updates don't cause noise.
+# Now also includes termination fee (ETF) context, and reports ETF changes.
 
 import hashlib, io, os, sys, datetime, time
 import requests
@@ -12,7 +13,7 @@ import pandas as pd
 from urllib.parse import urljoin, urlsplit, urlunsplit
 import urllib3
 
-print("SCRIPT_VERSION: 2025-08-20-STABLE-KEYS+URLNORM")
+print("SCRIPT_VERSION: 2025-08-20-STABLE-KEYS+URLNORM+ETF")
 
 # --- Pages to monitor ---
 TARGETS = [
@@ -48,14 +49,19 @@ TERM_FIELDS = [
     "TermLength", "Term (Months)", "Term", "Contract Term", "Term Months"
 ]
 
+# Termination fee / early termination fee variants
+TERMINATION_FEE_FIELDS = [
+    "EarlyTerminationFee", "Early Termination Fee", "Cancellation Fee",
+    "CancellationFee", "ETF", "Termination Fee"
+]
+
 # ID-ish fields we prefer if present (do NOT include rate/term here)
 OFFER_ID_HINT_FIELDS = [
     "OfferId", "OfferID", "GasOfferId", "GasOfferID", "Offer Code", "OfferCode",
     "PlanID", "ProductID", "SKU", "Plan Code", "PlanCode"
 ]
 
-# Stable fields to fingerprint an offer (avoid volatile marketing and *exclude* rate/term)
-# Note: we removed fees and promo text from the key so those show as normal changes, not add/remove.
+# Stable fields to fingerprint an offer (avoid volatile marketing and *exclude* rate/term/fee)
 STABLE_ID_FIELDS = [
     # Supplier identity
     "SupplierCompanyName", "CompanyName", "Supplier", "Company", "Supplier Name", "Company Name",
@@ -63,7 +69,7 @@ STABLE_ID_FIELDS = [
     "RateType",
     # URLs usually identify the exact SKU; we will normalize them (strip query/fragment)
     "TermsOfServiceURL", "SignUpNowURL",
-    # Optional: a plan/offer title if present (last resort; may change sometimes)
+    # Optional: plan/offer title if present
     "Offer", "Offer Name", "Plan", "Product Name"
 ]
 
@@ -246,7 +252,7 @@ def _stable_offer_key(row):
     Build a stable key for an offer:
     1) Use real ID columns if present (OfferID, PlanID, etc.)
     2) Else, hash a tuple of stable fields (Supplier, RateType, normalized URLs, optional plan title).
-       IMPORTANT: Do NOT include rate or term or promo text.
+       IMPORTANT: Do NOT include rate, term, fee, or promo text.
        Normalize URLs to ignore querystrings so tracking params don't create fake new offers.
     """
     # 1) Real ID columns if present
@@ -286,6 +292,7 @@ def df_from_csv_bytes(data_bytes):
     df["_Supplier"] = df.apply(lambda r: _first_present(r, SUPPLIER_NAME_COLS), axis=1)
     df["_Rate"]     = df.apply(lambda r: _first_present(r, RATE_FIELDS), axis=1)
     df["_Term"]     = df.apply(lambda r: _first_present(r, TERM_FIELDS), axis=1)
+    df["_ETF"]      = df.apply(lambda r: _first_present(r, TERMINATION_FEE_FIELDS), axis=1)
     return df
 
 # ---------- Normalize older snapshots to current logic ----------
@@ -313,8 +320,12 @@ def normalize_loaded_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["_Term"] = df.apply(lambda r: _first_present(r, TERM_FIELDS) or str(r["_Term"]), axis=1)
 
-    # ALWAYS recompute the stable key using the *current* logic (with URL normalization)
-    # Normalize URL fields before hashing
+    if "_ETF" not in df.columns:
+        df["_ETF"] = df.apply(lambda r: _first_present(r, TERMINATION_FEE_FIELDS), axis=1)
+    else:
+        df["_ETF"] = df.apply(lambda r: _first_present(r, TERMINATION_FEE_FIELDS) or str(r["_ETF"]), axis=1)
+
+    # Normalize URL fields before hashing, then recompute stable key
     for url_col in ["TermsOfServiceURL", "SignUpNowURL"]:
         if url_col in df.columns:
             df[url_col] = df[url_col].fillna("").astype(str).map(normalize_url)
@@ -407,6 +418,8 @@ def diff_frames(prev, curr):
                 "rate_after":  _get_val(rc, "_Rate"),
                 "term_before": _get_val(rp, "_Term"),
                 "term_after":  _get_val(rc, "_Term"),
+                "fee_before":  _get_val(rp, "_ETF"),
+                "fee_after":   _get_val(rc, "_ETF"),
                 "changes": diffs,
             })
 
@@ -430,28 +443,43 @@ def build_reports(name, report_dict):
     chg.append(f"=== Changes for {name} ===")
 
     # PRICE/TERM CHANGES (only)
-    interesting = []
+    price_term_changes = []
+    fee_only_changes = []
     for ch in report_dict["changed"]:
         touched = set(ch["changes"].keys())
         rate_touched = any(f in touched for f in RATE_FIELDS)
         term_touched = any(f in touched for f in TERM_FIELDS)
+        fee_touched  = any(f in touched for f in TERMINATION_FEE_FIELDS)
         if rate_touched or term_touched:
-            interesting.append(ch)
+            price_term_changes.append(ch)
+        elif fee_touched:
+            fee_only_changes.append(ch)
 
-    if interesting:
+    if price_term_changes:
         chg.append("PRICE/TERM CHANGES:")
         chg.append("Company | Field | Old -> New (context)")
         chg.append("----------------------------------------")
-        for ch_item in interesting:
+        for ch_item in price_term_changes:
             supplier = ch_item.get("supplier") or ch_item["key"]
+            etf = _label(ch_item.get("fee_after") or ch_item.get("fee_before"))
             # Rate changes
             if ch_item["rate_before"] != ch_item["rate_after"]:
-                chg.append(f"{supplier} | Rate | {_label(ch_item['rate_before'])} -> {_label(ch_item['rate_after'])} (term: {_label(ch_item['term_after'] or ch_item['term_before'])})")
+                chg.append(f"{supplier} | Rate | {_label(ch_item['rate_before'])} -> {_label(ch_item['rate_after'])} (term: {_label(ch_item['term_after'] or ch_item['term_before'])}, ETF: {etf})")
             # Term changes
             if ch_item["term_before"] != ch_item["term_after"]:
-                chg.append(f"{supplier} | Term | {_label(ch_item['term_before'])} -> {_label(ch_item['term_after'])} (rate: {_label(ch_item['rate_after'] or ch_item['rate_before'])})")
+                chg.append(f"{supplier} | Term | {_label(ch_item['term_before'])} -> {_label(ch_item['term_after'])} (rate: {_label(ch_item['rate_after'] or ch_item['rate_before'])}, ETF: {etf})")
     else:
         chg.append("No rate/term changes today.")
+
+    # ETF-only changes (optional, below price/term)
+    if fee_only_changes:
+        chg.append("")
+        chg.append("FEE CHANGES:")
+        chg.append("Company | Early Termination Fee | Old -> New")
+        chg.append("---------------------------------------------")
+        for ch_item in fee_only_changes:
+            supplier = ch_item.get("supplier") or ch_item["key"]
+            chg.append(f"{supplier} | {_label(ch_item.get('fee_before'))} -> {_label(ch_item.get('fee_after'))}")
 
     # NEW OFFERS (deduped by supplier|rate|term for readability)
     if report_dict["added"]:
@@ -459,7 +487,9 @@ def build_reports(name, report_dict):
         chg.append("NEW SUPPLIERS:")
         seen = set()
         for row in report_dict["added"]:
-            supplier, rate, term = label_from_row(row)
+            supplier = (row.get("_Supplier") or "").strip() or "n/a"
+            rate = (row.get("_Rate") or "").strip() or "n/a"
+            term = (row.get("_Term") or "").strip() or "n/a"
             key = (supplier, rate, term)
             if key in seen:
                 continue
@@ -472,7 +502,9 @@ def build_reports(name, report_dict):
         chg.append("REMOVED SUPPLIERS:")
         seen = set()
         for row in report_dict["removed"]:
-            supplier, rate, term = label_from_row(row)
+            supplier = (row.get("_Supplier") or "").strip() or "n/a"
+            rate = (row.get("_Rate") or "").strip() or "n/a"
+            term = (row.get("_Term") or "").strip() or "n/a"
             key = (supplier, rate, term)
             if key in seen:
                 continue
