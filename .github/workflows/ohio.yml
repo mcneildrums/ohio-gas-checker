@@ -2,65 +2,62 @@ name: apples-to-apples-daily
 
 on:
   schedule:
-    - cron: "30 12 * * *"   # 7:30 AM America/Chicago during DST
-  workflow_dispatch:
+    # 7:30 AM America/Chicago = 12:30 UTC during CDT.
+    # Weekdays only (Mon–Fri):
+    - cron: '30 12 * * 1-5'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write     # needed to commit snapshot CSVs
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
-          pip install --upgrade certifi requests urllib3
+          python -m pip install --upgrade pip
+          pip install requests pandas beautifulsoup4 urllib3
 
-      - name: Run scraper + diff
-        run: python apples_to_apples_diff.py
-
-      - name: Commit snapshots
+      - name: Scrape + diff
         run: |
-          git config user.name "automation"
-          git config user.email "noreply@example.com"
-          git add data/*.csv || true
-          git commit -m "snapshot $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "nothing to commit"
-          git push || true
+          python apples_to_apples_diff.py
 
-      # Read changes.txt (diff-only) into an output for the email body
-      - name: Read changes into output
-        id: get_changes
+      - name: Prepare email body
+        id: body
         run: |
-          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo 'text<<EOF' >> $GITHUB_OUTPUT
           cat changes.txt >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: apples-to-apples-artifacts
-          path: |
-            report.txt
-            changes.txt
-
-      - name: Email report (diff-only in body)
+      - name: Send email
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: ${{ secrets.SMTP_HOST }}   # e.g. smtp.gmail.com
-          server_port: ${{ secrets.SMTP_PORT }}      # e.g. 587
-          secure: false                              # false for 587 (STARTTLS); true for 465
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}     # App Password if Gmail
-          subject: "Ohio Apples-to-Apples: Changes Since Yesterday"
-          to: spatel@riverbendeg.com, jfeinstein@riverbendeg.com         # or a comma-separated list
-          from: ${{ secrets.REPORT_FROM_EMAIL }}
-          body: ${{ steps.get_changes.outputs.body }}
+          server_address: ${{ secrets.MAIL_SERVER }}
+          server_port: ${{ secrets.MAIL_PORT }}
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          from: ${{ secrets.MAIL_FROM }}
+          to: ${{ secrets.MAIL_TO }}${{ secrets.MAIL_TO2 && format(', {0}', secrets.MAIL_TO2) || '' }}
+          subject: "OH & Columbia Apples-to-Apples (Weekdays)"
+          body: ${{ steps.body.outputs.text }}
           attachments: |
             report.txt
             changes.txt
+
+      - name: Commit snapshots (optional)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/*.csv || true
+          git commit -m "Daily snapshots: $(date -u +'%Y-%m-%d')" || echo "No changes to commit"
+          git push || echo "Nothing to push"
