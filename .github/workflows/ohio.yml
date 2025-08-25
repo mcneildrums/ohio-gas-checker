@@ -2,8 +2,7 @@ name: apples-to-apples-daily
 
 on:
   schedule:
-    # 7:30 AM America/Chicago = 12:30 UTC during CDT.
-    # Weekdays only (Mon–Fri):
+    # Weekdays 7:30 AM America/Chicago = 12:30 UTC during CDT
     - cron: '30 12 * * 1-5'
   workflow_dispatch: {}
 
@@ -41,14 +40,15 @@ jobs:
       - name: Send email
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: ${{ secrets.MAIL_SERVER }}
-          server_port: ${{ secrets.MAIL_PORT }}
+          # Map to YOUR secrets
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
           secure: true
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          from: ${{ secrets.MAIL_FROM }}
-          to: ${{ secrets.MAIL_TO }}${{ secrets.MAIL_TO2 && format(', {0}', secrets.MAIL_TO2) || '' }}
-          subject: "OH & Columbia Apples-to-Apples (Weekdays)"
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: ${{ secrets.REPORT_FROM_EMAIL }}     # <-- this was missing
+          to: ${{ secrets.REPORT_TO_EMAIL }}         # comma-separate multiple emails inside the secret value if you like
+          subject: "Ohio & Columbia — Apples-to-Apples Weekday Diff"
           body: ${{ steps.body.outputs.text }}
           attachments: |
             report.txt
