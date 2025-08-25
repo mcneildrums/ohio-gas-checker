@@ -2,7 +2,8 @@
 # apples_to_apples_diff.py
 # Purpose: Email only price/rate and term changes + list truly new/removed offers,
 # using STABLE keys so row/order changes or price/term updates don't cause noise.
-# Now also includes termination fee (ETF) context, and reports ETF changes.
+# Includes termination fee (ETF) context. Handles multiple territories.
+# Weekends (Sat/Sun): script generates a short "skipped" message.
 
 import hashlib, io, os, sys, datetime, time
 import requests
@@ -13,17 +14,35 @@ import pandas as pd
 from urllib.parse import urljoin, urlsplit, urlunsplit
 import urllib3
 
-print("SCRIPT_VERSION: 2025-08-20-STABLE-KEYS+URLNORM+ETF")
+print("SCRIPT_VERSION: 2025-08-25-MULTI-TARGETS-WEEKDAYS-ETF")
 
-# --- Pages to monitor ---
+# --- Pages to monitor (label, url) ---
 TARGETS = [
-    ("Enbridge/Dominion - Residential",
-     "https://www.energychoice.ohio.gov/ApplesToApplesComparision.aspx?Category=NaturalGas&RateCode=1&TerritoryId=1"),
+    # Dominion / Enbridge (TerritoryId=1)
+    ("Dominion (Enbridge) - Residential",
+     "https://energychoice.ohio.gov/ApplesToApplesComparision.aspx?Category=NaturalGas&RateCode=1&TerritoryId=1"),
+    ("Dominion (Enbridge) - Commercial",
+     "https://energychoice.ohio.gov/ApplesToApplesComparision.aspx?Category=NaturalGas&TerritoryId=1&TariffCodeId=26&RateCode=2"),
+
+    # Columbia (TerritoryId=8)
+    ("Columbia Gas - Residential",
+     "https://energychoice.ohio.gov/ApplesToApplesComparision.aspx?Category=NaturalGas&TerritoryId=8&RateCode=1"),
+    ("Columbia Gas - Commercial",
+     "https://energychoice.ohio.gov/ApplesToApplesComparision.aspx?Category=NaturalGas&TerritoryId=8&TariffCodeId=24&RateCode=2"),
 ]
 
 OUTDIR = "data"
 os.makedirs(OUTDIR, exist_ok=True)
 today = datetime.date.today().isoformat()
+
+# Weekends: create a minimal report and exit cleanly (workflow also avoids weekends via cron)
+if datetime.date.today().weekday() >= 5:  # 5=Sat, 6=Sun
+    with open("report.txt", "w", encoding="utf-8") as f:
+        f.write("=== Weekend ===\nSkipping run on Saturday/Sunday.\n")
+    with open("changes.txt", "w", encoding="utf-8") as f:
+        f.write("=== Weekend ===\nSkipping run on Saturday/Sunday.\n")
+    print("Weekend: skipping run.")
+    sys.exit(0)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -34,7 +53,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# Column variants seen in CSVs
+# Column variants
 SUPPLIER_NAME_COLS = [
     "Supplier", "Company", "Company Name", "Supplier Name",
     "SupplierCompanyName", "CompanyName"
@@ -55,19 +74,19 @@ TERMINATION_FEE_FIELDS = [
     "CancellationFee", "ETF", "Termination Fee"
 ]
 
-# ID-ish fields we prefer if present (do NOT include rate/term here)
+# Preferred ID-like fields (do NOT include rate/term)
 OFFER_ID_HINT_FIELDS = [
     "OfferId", "OfferID", "GasOfferId", "GasOfferID", "Offer Code", "OfferCode",
     "PlanID", "ProductID", "SKU", "Plan Code", "PlanCode"
 ]
 
-# Stable fields to fingerprint an offer (avoid volatile marketing and *exclude* rate/term/fee)
+# Stable fields for fingerprinting an offer (exclude rate/term/fee/promos)
 STABLE_ID_FIELDS = [
     # Supplier identity
     "SupplierCompanyName", "CompanyName", "Supplier", "Company", "Supplier Name", "Company Name",
     # Plan meta that tends to be structurally stable
     "RateType",
-    # URLs usually identify the exact SKU; we will normalize them (strip query/fragment)
+    # URLs identify SKUs (we'll normalize them)
     "TermsOfServiceURL", "SignUpNowURL",
     # Optional: plan/offer title if present
     "Offer", "Offer Name", "Plan", "Product Name"
@@ -76,7 +95,7 @@ STABLE_ID_FIELDS = [
 # ---------- Helpers ----------
 
 def normalize_url(u: str) -> str:
-    """Normalize a URL for identity: lowercase scheme/host, keep only scheme/netloc/path; drop query & fragment."""
+    """Normalize URL: lowercase scheme/host, keep scheme/netloc/path; drop query & fragment."""
     if not u:
         return ""
     try:
@@ -123,7 +142,7 @@ def http_post(session, url, data, verify=True, connect_timeout=20, read_timeout=
     headers = {
         **HEADERS,
         "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": "https://www.energychoice.ohio.gov",
+        "Origin": "https://energychoice.ohio.gov",
         "Referer": url,
     }
     try:
@@ -201,7 +220,7 @@ def fetch_csv_bytes_from_page(page_url):
     if "text/csv" in ct or "application/vnd.ms-excel" in ct:
         return r2.content
 
-    # try finding a CSV link in the returned HTML
+    # try finding a CSV link in returned HTML
     try:
         soup2 = BeautifulSoup(r2.text, "html.parser")
         for a in soup2.find_all("a", href=True):
@@ -212,7 +231,7 @@ def fetch_csv_bytes_from_page(page_url):
     except Exception:
         pass
 
-    # fallback: mislabeled CSV text
+    # fallback: mislabeled CSV-like text
     if r2.text and ("," in r2.text or "\t" in r2.text) and "\n" in r2.text:
         return r2.content
 
@@ -253,7 +272,6 @@ def _stable_offer_key(row):
     1) Use real ID columns if present (OfferID, PlanID, etc.)
     2) Else, hash a tuple of stable fields (Supplier, RateType, normalized URLs, optional plan title).
        IMPORTANT: Do NOT include rate, term, fee, or promo text.
-       Normalize URLs to ignore querystrings so tracking params don't create fake new offers.
     """
     # 1) Real ID columns if present
     for c in row.index:
@@ -271,7 +289,7 @@ def _stable_offer_key(row):
                 v = normalize_url(v)
             parts.append(f"{c}={v}")
 
-    # If we couldn't collect anything, fallback to supplier only
+    # If nothing else, fallback to supplier only
     if not parts:
         supplier = _first_present(row, SUPPLIER_NAME_COLS)
         parts = [f"Supplier={supplier}"]
@@ -288,7 +306,7 @@ def df_from_csv_bytes(data_bytes):
     # Create stable key per row
     df["_Key"] = df.apply(_stable_offer_key, axis=1)
 
-    # Convenience columns for later display/grouping
+    # Convenience columns for display/grouping
     df["_Supplier"] = df.apply(lambda r: _first_present(r, SUPPLIER_NAME_COLS), axis=1)
     df["_Rate"]     = df.apply(lambda r: _first_present(r, RATE_FIELDS), axis=1)
     df["_Term"]     = df.apply(lambda r: _first_present(r, TERM_FIELDS), axis=1)
@@ -334,15 +352,11 @@ def normalize_loaded_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def label_from_row(row: dict) -> tuple[str, str, str]:
-    """
-    Safe label builder for NEW/REMOVED sections that works for both old/new snapshots.
-    Returns (supplier, rate, term).
-    """
+    """Return (supplier, rate, term) with fallbacks for old snapshots."""
     supplier = (row.get("_Supplier") or "").strip()
     rate = (row.get("_Rate") or "").strip()
     term = (row.get("_Term") or "").strip()
 
-    # If helpers not present (older snapshot dict), derive from raw columns:
     if not supplier:
         for c in SUPPLIER_NAME_COLS:
             if c in row and str(row[c]).strip():
@@ -367,11 +381,7 @@ def diff_frames(prev, curr):
     import pandas as pd
 
     def _get_val(row: pd.Series, col: str) -> str:
-        """
-        Safe scalar getter from a pandas Series:
-        - returns '' if missing or NaN
-        - if duplicate column labels exist (Series of values), pick first non-NaN
-        """
+        """Safe scalar getter; returns '' if missing/NaN; collapses duplicate labels to first non-NaN."""
         if col not in row.index:
             return ""
         v = row[col]
@@ -396,7 +406,7 @@ def diff_frames(prev, curr):
     common_keys = curr.index.intersection(prev.index)
 
     changed = []
-    # Compare over the intersection of columns, skip internal (_*)
+    # Compare over intersection of columns, skip internal (_*)
     common_cols = sorted(set(curr.columns).intersection(prev.columns))
     common_cols = [c for c in common_cols if not c.startswith("_")]
 
@@ -471,7 +481,7 @@ def build_reports(name, report_dict):
     else:
         chg.append("No rate/term changes today.")
 
-    # ETF-only changes (optional, below price/term)
+    # ETF-only changes
     if fee_only_changes:
         chg.append("")
         chg.append("FEE CHANGES:")
@@ -481,15 +491,13 @@ def build_reports(name, report_dict):
             supplier = ch_item.get("supplier") or ch_item["key"]
             chg.append(f"{supplier} | {_label(ch_item.get('fee_before'))} -> {_label(ch_item.get('fee_after'))}")
 
-    # NEW OFFERS (deduped by supplier|rate|term for readability)
+    # NEW OFFERS (deduped by supplier|rate|term)
     if report_dict["added"]:
         chg.append("")
         chg.append("NEW SUPPLIERS:")
         seen = set()
         for row in report_dict["added"]:
-            supplier = (row.get("_Supplier") or "").strip() or "n/a"
-            rate = (row.get("_Rate") or "").strip() or "n/a"
-            term = (row.get("_Term") or "").strip() or "n/a"
+            supplier, rate, term = label_from_row(row)
             key = (supplier, rate, term)
             if key in seen:
                 continue
@@ -502,16 +510,14 @@ def build_reports(name, report_dict):
         chg.append("REMOVED SUPPLIERS:")
         seen = set()
         for row in report_dict["removed"]:
-            supplier = (row.get("_Supplier") or "").strip() or "n/a"
-            rate = (row.get("_Rate") or "").strip() or "n/a"
-            term = (row.get("_Term") or "").strip() or "n/a"
+            supplier, rate, term = label_from_row(row)
             key = (supplier, rate, term)
             if key in seen:
                 continue
             seen.add(key)
             chg.append(f"{supplier} (Rate={_label(rate)}, Term={_label(term)})")
 
-    # Optional: brief full change dump (can help debug)
+    # Optional: brief full change dump (helps debug)
     if report_dict["changed"]:
         full.append("Changed details:")
         for ch_item in report_dict["changed"]:
@@ -520,11 +526,6 @@ def build_reports(name, report_dict):
                 full.append(f"- {supplier} | {col}: '{vals['before']}' -> '{vals['after']}'")
     else:
         full.append("No field-level changes today.")
-
-    if report_dict["added"]:
-        full.append(f"Added offers: {len(report_dict['added'])}")
-    if report_dict["removed"]:
-        full.append(f"Removed offers: {len(report_dict['removed'])}")
 
     full.append("")
     chg.append("")
@@ -551,11 +552,10 @@ def main():
 
         if prev_files:
             prev_df = pd.read_csv(os.path.join(OUTDIR, prev_files[-1]), dtype=str)
-            # Normalize the loaded (older) snapshot to current logic (including URL normalization)
             prev_df = normalize_loaded_df(prev_df)
             report = diff_frames(prev_df, curr_df)
         else:
-            # First-ever run for this page: treat all as "added"
+            # First run for this page
             report = {"added": curr_df.to_dict(orient="records"), "removed": [], "changed": []}
 
         full_text, chg_text = build_reports(name, report)
